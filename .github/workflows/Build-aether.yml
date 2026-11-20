@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     paths:
-      - "**.zip"
+      - "AETHER-OS-builder.zip"
       - ".github/workflows/Build-aether.yml"
 
 permissions:
@@ -14,138 +14,116 @@ jobs:
   build:
     name: Build bootable AMD64 ISO
     runs-on: ubuntu-24.04
-    timeout-minutes: 360
+    timeout-minutes: 180
 
     steps:
-      - name: Check out repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Extract AETHER builder ZIP
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          ZIP_FILE=""
-
-          if [[ -f "AETHER-OS-builder.zip" ]]; then
-            ZIP_FILE="AETHER-OS-builder.zip"
-          else
-            mapfile -t ZIP_FILES < <(
-              find . -maxdepth 3 -type f -iname '*.zip' \
-                ! -path './.git/*' | sort
-            )
-            if [[ "${#ZIP_FILES[@]}" -ne 1 ]]; then
-              echo "::error::Expected one builder ZIP in the repository."
-              printf 'ZIP files found: %s\n' "${ZIP_FILES[*]:-none}"
-              exit 1
-            fi
-            ZIP_FILE="${ZIP_FILES[0]}"
-          fi
-
-          mkdir -p "$GITHUB_WORKSPACE/aether-source"
-          unzip -q "$ZIP_FILE" -d "$GITHUB_WORKSPACE/aether-source"
-          echo "Extracted: $ZIP_FILE"
-          find "$GITHUB_WORKSPACE/aether-source" -maxdepth 4 -type f | sort | head -300
-
-      - name: Install ISO build dependencies
+      - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            live-build debootstrap xorriso squashfs-tools \
-            mtools dosfstools grub-common grub2-common \
-            grub-pc-bin grub-efi-amd64-bin \
+            live-build debootstrap debian-archive-keyring \
+            xorriso squashfs-tools mtools dosfstools \
+            grub-common grub2-common grub-pc-bin grub-efi-amd64-bin \
             rsync curl wget git make gcc g++ python3 \
-            qemu-user-static binfmt-support
+            qemu-user-static binfmt-support unzip
 
-      - name: Run AETHER build-iso.sh
+      - name: Extract AETHER OS source
         shell: bash
         run: |
-          set -Eeuo pipefail
-          SRC="$GITHUB_WORKSPACE/aether-source"
-
-          mapfile -t SCRIPTS < <(
-            find "$SRC" -type f -path '*/scripts/build-iso.sh' \
-              ! -path '*/.git/*' | sort
-          )
-
-          if [[ "${#SCRIPTS[@]}" -eq 0 ]]; then
-            mapfile -t SCRIPTS < <(
-              find "$SRC" -type f \
-                \( -iname 'build-aether.sh' -o -iname 'build.sh' \) \
-                ! -path '*/.git/*' | sort
-            )
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/aether-source"
+          if [ -f "$GITHUB_WORKSPACE/AETHER-OS-builder.zip" ]; then
+            ZIP="$GITHUB_WORKSPACE/AETHER-OS-builder.zip"
+          else
+            mapfile -t ZIPS < <(find "$GITHUB_WORKSPACE" -maxdepth 2 -type f -name '*.zip')
+            if [ "${#ZIPS[@]}" -ne 1 ]; then
+              echo "::error::Expected AETHER-OS-builder.zip or exactly one ZIP archive."
+              find "$GITHUB_WORKSPACE" -maxdepth 3 -type f -name '*.zip' -print
+              exit 1
+            fi
+            ZIP="${ZIPS[0]}"
           fi
+          unzip -q "$ZIP" -d "$GITHUB_WORKSPACE/aether-source"
 
-          if [[ "${#SCRIPTS[@]}" -eq 0 ]]; then
-            echo "::error::Could not find the AETHER build script."
-            find "$SRC" -maxdepth 6 -type f | sort
+          mapfile -t SCRIPTS < <(find "$GITHUB_WORKSPACE/aether-source" -type f -path '*/scripts/build-iso.sh')
+          if [ "${#SCRIPTS[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one scripts/build-iso.sh."
+            find "$GITHUB_WORKSPACE/aether-source" -maxdepth 6 -type f -print
             exit 1
           fi
 
-          BUILD_SCRIPT="${SCRIPTS[0]}"
-          SCRIPT_DIR="$(dirname "$BUILD_SCRIPT")"
+          echo "BUILD_SCRIPT=${SCRIPTS[0]}" >> "$GITHUB_ENV"
+          echo "PROJECT_ROOT=$(dirname "$(dirname "${SCRIPTS[0]}")")" >> "$GITHUB_ENV"
 
-          if [[ "$SCRIPT_DIR" == */scripts ]]; then
-            PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-          else
-            PROJECT_DIR="$SCRIPT_DIR"
-          fi
-
+      - name: Configure Debian mirrors and keyring
+        shell: bash
+        run: |
+          set -euo pipefail
           echo "Build script: $BUILD_SCRIPT"
-          echo "Project root: $PROJECT_DIR"
+          echo "Project root: $PROJECT_ROOT"
 
-          chmod +x "$BUILD_SCRIPT"
-          cd "$PROJECT_DIR"
+          # Ubuntu's packaged live-build otherwise inherits Ubuntu's mirror
+          # defaults, which cannot provide Debian's trixie suite.
+          # Force every live-build stage to use the Debian repositories.
+          python3 - "$BUILD_SCRIPT" <<'PY'
+          import pathlib, sys
+          p = pathlib.Path(sys.argv[1])
+          s = p.read_text()
+          old = "--distribution trixie"
+          new = (
+              "--distribution trixie "
+              "--mirror-bootstrap https://deb.debian.org/debian "
+              "--mirror-chroot https://deb.debian.org/debian "
+              "--mirror-binary https://deb.debian.org/debian "
+              "--mirror-chroot-security https://security.debian.org/debian-security"
+          )
+          if old not in s:
+              raise SystemExit("Could not find '--distribution trixie' in build-iso.sh")
+          s = s.replace(old, new, 1)
 
-          # Fix compatibility with Ubuntu 24.04 live-build.
-          # Its lb config does not accept the plural --bootloaders option.
-          # The amd64 iso-hybrid defaults provide the supported boot setup.
-          if grep -q -- '--bootloaders' "$BUILD_SCRIPT"; then
-            sed -i -E \
-              's/--bootloaders[[:space:]]+grub-pc,grub-efi[[:space:]]*//g' \
-              "$BUILD_SCRIPT"
-          fi
+          # Ubuntu's live-build version does not support this option.
+          import re
+          s = re.sub(r'--bootloaders\s+grub-pc,grub-efi\s*', '', s)
+          p.write_text(s)
+          PY
 
-          echo "Checking live-build configuration options..."
+          test -s /usr/share/keyrings/debian-archive-keyring.gpg
+          live-build --version || true
           lb config --help >/dev/null
 
-          sudo -E bash "$BUILD_SCRIPT"
-
-      - name: Find and prepare ISO
+      - name: Build ISO
         shell: bash
         run: |
-          set -Eeuo pipefail
-          mkdir -p "$GITHUB_WORKSPACE/iso-output"
+          set -euo pipefail
+          cd "$PROJECT_ROOT"
+          sudo -E bash "$BUILD_SCRIPT"
 
-          mapfile -t ISOS < <(
-            find "$GITHUB_WORKSPACE" -type f -iname '*.iso' \
-              ! -path '*/.git/*' \
-              ! -path '*/iso-output/*' | sort
-          )
-
-          if [[ "${#ISOS[@]}" -eq 0 ]]; then
-            echo "::error::The build did not produce an ISO."
-            find "$GITHUB_WORKSPACE/aether-source" -maxdepth 7 -type f | sort | tail -250
+      - name: Collect ISO and checksum
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/output"
+          mapfile -t ISOS < <(find "$PROJECT_ROOT" -type f -iname '*.iso' -size +10M)
+          if [ "${#ISOS[@]}" -eq 0 ]; then
+            echo "::error::Build finished but no ISO was found."
+            find "$PROJECT_ROOT" -maxdepth 5 -type f | sort | tail -200
             exit 1
           fi
-
-          SELECTED="${ISOS[0]}"
-          for candidate in "${ISOS[@]}"; do
-            if [[ "$(basename "$candidate")" == "AETHER-OS-01.iso" ]]; then
-              SELECTED="$candidate"
-              break
-            fi
-          done
-
-          cp "$SELECTED" "$GITHUB_WORKSPACE/iso-output/AETHER-OS-01.iso"
-          ls -lh "$GITHUB_WORKSPACE/iso-output/AETHER-OS-01.iso"
-          sha256sum "$GITHUB_WORKSPACE/iso-output/AETHER-OS-01.iso" \
-            | tee "$GITHUB_WORKSPACE/iso-output/SHA256SUMS.txt"
+          ISO="${ISOS[0]}"
+          cp "$ISO" "$GITHUB_WORKSPACE/output/AETHER-OS-01.iso"
+          cd "$GITHUB_WORKSPACE/output"
+          sha256sum AETHER-OS-01.iso > SHA256SUMS
+          ls -lh AETHER-OS-01.iso SHA256SUMS
 
       - name: Upload AETHER OS ISO
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: AETHER-OS-01-iso
-          path: iso-output/*
+          path: output/*
           if-no-files-found: error
-          compression-level: 0
           retention-days: 14
