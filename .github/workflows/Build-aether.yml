@@ -1,0 +1,124 @@
+name: Build AETHER OS ISO
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "AETHER-OS-builder.zip"
+      - ".github/workflows/build-aether.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build bootable AMD64 ISO
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Find and extract builder ZIP
+        id: extract
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          ZIP_FILE=""
+          if [[ -f "AETHER-OS-builder.zip" ]]; then
+            ZIP_FILE="AETHER-OS-builder.zip"
+          else
+            mapfile -t ZIP_FILES < <(find . -maxdepth 2 -type f -iname '*.zip' \
+              ! -path './.git/*' | sort)
+            if [[ "${#ZIP_FILES[@]}" -ne 1 ]]; then
+              echo "::error::Put AETHER-OS-builder.zip in the repository root, or make sure there is exactly one ZIP file."
+              printf 'ZIP files found: %s\n' "${ZIP_FILES[*]:-none}"
+              exit 1
+            fi
+            ZIP_FILE="${ZIP_FILES[0]}"
+          fi
+
+          mkdir -p "$GITHUB_WORKSPACE/aether-source"
+          unzip -q "$ZIP_FILE" -d "$GITHUB_WORKSPACE/aether-source"
+
+          echo "Extracted $ZIP_FILE"
+          find "$GITHUB_WORKSPACE/aether-source" -maxdepth 3 -type f | sort | head -200
+
+      - name: Install ISO build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            live-build debootstrap xorriso squashfs-tools \
+            mtools dosfstools grub-common grub2-common \
+            grub-pc-bin grub-efi-amd64-bin \
+            rsync curl wget git make gcc g++ python3
+
+      - name: Locate and run AETHER build script
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          SRC="$GITHUB_WORKSPACE/aether-source"
+
+          mapfile -t SCRIPTS < <(find "$SRC" -type f \
+            \( -iname 'build-aether.sh' -o -iname 'build.sh' \) \
+            ! -path '*/.git/*' | sort)
+
+          if [[ "${#SCRIPTS[@]}" -eq 0 ]]; then
+            echo "::error::The ZIP must contain build-aether.sh (or build.sh)."
+            echo "Extracted files:"
+            find "$SRC" -maxdepth 4 -type f | sort | head -300
+            exit 1
+          fi
+
+          BUILD_SCRIPT="${SCRIPTS[0]}"
+          BUILD_DIR="$(dirname "$BUILD_SCRIPT")"
+          echo "Running: $BUILD_SCRIPT"
+          cd "$BUILD_DIR"
+          chmod +x "$BUILD_SCRIPT"
+
+          # Keep the build script's working directory as its project root.
+          sudo -E bash "$BUILD_SCRIPT"
+
+      - name: Collect generated ISO
+        id: collect
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/iso-output"
+
+          mapfile -t ISOS < <(find "$GITHUB_WORKSPACE" \
+            -type f -iname '*.iso' \
+            ! -path '*/.git/*' \
+            ! -path '*/iso-output/*' | sort)
+
+          if [[ "${#ISOS[@]}" -eq 0 ]]; then
+            echo "::error::Build finished but no .iso file was found."
+            echo "Recent build files:"
+            find "$GITHUB_WORKSPACE/aether-source" -maxdepth 5 -type f | sort | tail -200
+            exit 1
+          fi
+
+          # Prefer the requested final filename if the builder created another name.
+          SELECTED="${ISOS[0]}"
+          for candidate in "${ISOS[@]}"; do
+            if [[ "$(basename "$candidate")" == "AETHER-OS-01.iso" ]]; then
+              SELECTED="$candidate"
+              break
+            fi
+          done
+
+          cp "$SELECTED" "$GITHUB_WORKSPACE/iso-output/AETHER-OS-01.iso"
+          ls -lh "$GITHUB_WORKSPACE/iso-output/AETHER-OS-01.iso"
+          sha256sum "$GITHUB_WORKSPACE/iso-output/AETHER-OS-01.iso" \
+            | tee "$GITHUB_WORKSPACE/iso-output/SHA256SUMS.txt"
+
+      - name: Upload AETHER OS ISO
+        uses: actions/upload-artifact@v4
+        with:
+          name: AETHER-OS-01-iso
+          path: iso-output/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
