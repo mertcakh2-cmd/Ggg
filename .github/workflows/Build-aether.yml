@@ -1,3 +1,4 @@
+
 name: Build AETHER OS ISO
 
 on:
@@ -89,6 +90,15 @@ jobs:
           s = re.sub(r'--bootloaders\s+grub-pc,grub-efi\s*', '', s)
           p.write_text(s)
           PY
+
+          # fonts-rubik is not packaged in Debian Trixie. Replace it with
+          # the available Roboto family so package installation can continue.
+          while IFS= read -r -d '' listfile; do
+            if grep -qE '(^|[[:space:]])fonts-rubik([[:space:]]|$)' "$listfile"; then
+              sed -i -E 's/(^|[[:space:]])fonts-rubik([[:space:]]|$)/\\1fonts-roboto\\2/g' "$listfile"
+              echo "Replaced unavailable fonts-rubik in $listfile"
+            fi
+          done < <(find "$PROJECT_ROOT/config/package-lists" -type f -name '*.list.chroot' -print0 2>/dev/null || true)
 
           test -s /usr/share/keyrings/debian-archive-keyring.gpg
           live-build --version || true
