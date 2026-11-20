@@ -111,6 +111,25 @@ jobs:
                       print(f"Replaced fonts-rubik with fonts-liberation2 in {path}")
           PYFIX
 
+          # Hyprland comes from trixie-backports and requires a newer
+          # libxkbcommon0 than stable provides. Backports are normally pinned
+          # at priority 100, so explicitly prefer this one dependency from
+          # trixie-backports during the live-build chroot package install.
+          python3 - "$PROJECT_ROOT/config/archives" <<'PINFIX'
+          from pathlib import Path
+          import sys
+
+          root = Path(sys.argv[1])
+          root.mkdir(parents=True, exist_ok=True)
+          pin = root / "aether-libxkbcommon.pref.chroot"
+          pin.write_text(
+              "Package: libxkbcommon0\\n"
+              "Pin: release n=trixie-backports\\n"
+              "Pin-Priority: 990\\n"
+          )
+          print(f"Created backports pin: {pin}")
+          PINFIX
+
           test -s /usr/share/keyrings/debian-archive-keyring.gpg
           live-build --version || true
           lb config --help >/dev/null
