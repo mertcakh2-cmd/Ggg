@@ -24,8 +24,8 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-
           ZIP_FILE=""
+
           if [[ -f "AETHER-OS-builder.zip" ]]; then
             ZIP_FILE="AETHER-OS-builder.zip"
           else
@@ -33,9 +33,8 @@ jobs:
               find . -maxdepth 3 -type f -iname '*.zip' \
                 ! -path './.git/*' | sort
             )
-
             if [[ "${#ZIP_FILES[@]}" -ne 1 ]]; then
-              echo "::error::Expected one builder ZIP. Put AETHER-OS-builder.zip in the repository root."
+              echo "::error::Expected one builder ZIP in the repository."
               printf 'ZIP files found: %s\n' "${ZIP_FILES[*]:-none}"
               exit 1
             fi
@@ -44,9 +43,7 @@ jobs:
 
           mkdir -p "$GITHUB_WORKSPACE/aether-source"
           unzip -q "$ZIP_FILE" -d "$GITHUB_WORKSPACE/aether-source"
-
           echo "Extracted: $ZIP_FILE"
-          echo "ZIP contents:"
           find "$GITHUB_WORKSPACE/aether-source" -maxdepth 4 -type f | sort | head -300
 
       - name: Install ISO build dependencies
@@ -65,14 +62,11 @@ jobs:
           set -Eeuo pipefail
           SRC="$GITHUB_WORKSPACE/aether-source"
 
-          # The supplied ZIP has this layout:
-          # AETHER-OS/scripts/build-iso.sh
           mapfile -t SCRIPTS < <(
             find "$SRC" -type f -path '*/scripts/build-iso.sh' \
               ! -path '*/.git/*' | sort
           )
 
-          # Support alternate builder layouts as a fallback.
           if [[ "${#SCRIPTS[@]}" -eq 0 ]]; then
             mapfile -t SCRIPTS < <(
               find "$SRC" -type f \
@@ -82,7 +76,7 @@ jobs:
           fi
 
           if [[ "${#SCRIPTS[@]}" -eq 0 ]]; then
-            echo "::error::Could not find scripts/build-iso.sh, build-aether.sh, or build.sh in the ZIP."
+            echo "::error::Could not find the AETHER build script."
             find "$SRC" -maxdepth 6 -type f | sort
             exit 1
           fi
@@ -90,7 +84,6 @@ jobs:
           BUILD_SCRIPT="${SCRIPTS[0]}"
           SCRIPT_DIR="$(dirname "$BUILD_SCRIPT")"
 
-          # For scripts/build-iso.sh, the project root is its parent directory.
           if [[ "$SCRIPT_DIR" == */scripts ]]; then
             PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
           else
@@ -103,7 +96,18 @@ jobs:
           chmod +x "$BUILD_SCRIPT"
           cd "$PROJECT_DIR"
 
-          # Build from the project root so config/, assets/, and src/ resolve correctly.
+          # Fix compatibility with Ubuntu 24.04 live-build.
+          # Its lb config does not accept the plural --bootloaders option.
+          # The amd64 iso-hybrid defaults provide the supported boot setup.
+          if grep -q -- '--bootloaders' "$BUILD_SCRIPT"; then
+            sed -i -E \
+              's/--bootloaders[[:space:]]+grub-pc,grub-efi[[:space:]]*//g' \
+              "$BUILD_SCRIPT"
+          fi
+
+          echo "Checking live-build configuration options..."
+          lb config --help >/dev/null
+
           sudo -E bash "$BUILD_SCRIPT"
 
       - name: Find and prepare ISO
@@ -119,8 +123,7 @@ jobs:
           )
 
           if [[ "${#ISOS[@]}" -eq 0 ]]; then
-            echo "::error::The build script finished but did not produce an ISO."
-            echo "Build output files:"
+            echo "::error::The build did not produce an ISO."
             find "$GITHUB_WORKSPACE/aether-source" -maxdepth 7 -type f | sort | tail -250
             exit 1
           fi
